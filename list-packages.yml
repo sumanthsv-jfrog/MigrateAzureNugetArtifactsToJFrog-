@@ -1,0 +1,86 @@
+trigger: none
+
+jobs:
+- job: ListNuGetPackages
+  displayName: 'List all packages in Azure NuGet feed'
+  pool:
+    name: Default
+
+  variables:
+    ADO_ORG: 'sumanthsv'
+    ADO_PROJECT: 'nugetproject'
+    ADO_FEED: 'nuget-feed'
+    OUTPUT_DIR: '$(Build.ArtifactStagingDirectory)'
+
+  steps:
+  - checkout: self
+
+  - task: CmdLine@2
+    displayName: 'Fetch all NuGet packages from Azure feed'
+    env:
+      ADO_PAT: $(ADO_PAT)
+    inputs:
+      script: |
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        AUTH="Authorization: Basic ${BASE64_PAT}"
+        API_BASE="https://feeds.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_apis/packaging/feeds/$(ADO_FEED)"
+
+        OUTPUT_FILE="$(OUTPUT_DIR)/nuget-packages-to-sync.txt"
+        > $OUTPUT_FILE
+
+        TOTAL=0
+        SKIP=0
+        PAGE_SIZE=100
+
+        echo "Fetching NuGet packages..."
+
+        while true; do
+          echo "Fetching page: skip=$SKIP"
+
+          RESPONSE=$(curl -sf -H "$AUTH" \
+            "${API_BASE}/packages?protocolType=nuget&\$top=${PAGE_SIZE}&\$skip=${SKIP}&api-version=7.0-preview.1" \
+            2>/dev/null || echo "")
+
+          # Stop if empty response
+          if [ -z "$RESPONSE" ]; then
+            echo "Empty response, stopping"
+            break
+          fi
+
+          # Validate JSON
+          if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+            echo "Invalid JSON response, stopping"
+            break
+          fi
+
+          PAGE_COUNT=$(echo "$RESPONSE" | jq '.value | length' 2>/dev/null || echo "0")
+
+          # Stop if no packages returned
+          if [ -z "$PAGE_COUNT" ] || [ "$PAGE_COUNT" = "0" ] || [ "$PAGE_COUNT" = "null" ]; then
+            echo "No more packages, stopping"
+            break
+          fi
+
+          echo "Got $PAGE_COUNT packages"
+
+          # Write packageId:version for ALL versions
+          echo "$RESPONSE" | jq -r '.value[] | . as $pkg | .versions[].version as $ver | $pkg.name + ":" + $ver' >> $OUTPUT_FILE
+
+          TOTAL=$((TOTAL + PAGE_COUNT))
+          SKIP=$((SKIP + PAGE_SIZE))
+
+          [ "$TOTAL" -ge 100000 ] && break
+        done
+
+        echo "══════════════════════════════════════"
+        echo "Total packages found: $TOTAL"
+        echo ""
+        echo "Contents:"
+        cat $OUTPUT_FILE
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish NuGet package list as artifact'
+    inputs:
+      PathtoPublish: '$(OUTPUT_DIR)'
+      ArtifactName: 'nuget-packages-list'
+      publishLocation: 'Container'

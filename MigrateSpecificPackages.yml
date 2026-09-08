@@ -1,0 +1,140 @@
+trigger: none
+
+jobs:
+- job: MigrateSpecificNuGetPackages
+  displayName: 'Migrate specific NuGet packages from ADO to JFrog'
+  pool:
+    name: Default
+
+  variables:
+    JFROG_NUGET_REPO: 'bupa-nuget-local'
+    ADO_ORG: 'sumanthsv'
+    ADO_PROJECT: 'nugetproject'
+    ADO_FEED: 'nuget-feed'
+    UPLOAD_DIR: '$(Pipeline.Workspace)/nuget-upload'
+
+  steps:
+  - checkout: self
+
+  # ── Step 1: JFrog CLI Pre-checks ─────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'JFrog CLI Pre-checks'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf c show
+        jf rt ping
+
+  - task: CmdLine@2
+    displayName: 'Debug NuGet download URL'
+    env:
+      ADO_PAT: $(ADO_PAT)
+    inputs:
+      script: |
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        AUTH="Authorization: Basic ${BASE64_PAT}"
+        NUGET_BASE="https://pkgs.dev.azure.com/sumanthsv/nugetproject/_packaging/nuget-feed/nuget/v3/flat2"
+
+        echo "=== Try 1: flat2 with -L ==="
+        curl -s -L -v -H "$AUTH" \
+          "${NUGET_BASE}/newtonsoft.json/13.0.4/newtonsoft.json.13.0.4.nupkg" \
+          -o /tmp/test.nupkg 2>&1 | grep -E "< HTTP|Location|GET"
+        echo "File size: $(ls -lh /tmp/test.nupkg 2>/dev/null | awk '{print $5}')"
+
+        echo ""
+        echo "=== Try 2: index.json to find correct URL ==="
+        curl -s -L -H "$AUTH" \
+          "${NUGET_BASE}/newtonsoft.json/index.json"
+          
+  # ── Step 2: Download specific packages ───────────────────────────
+  - task: CmdLine@2
+    displayName: 'Download NuGet packages from Azure feed'
+    env:
+      ADO_PAT: $(ADO_PAT)
+    inputs:
+      script: |
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        AUTH="Authorization: Basic ${BASE64_PAT}"
+        NUGET_BASE="https://pkgs.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_packaging/$(ADO_FEED)/nuget/v3/flat2"
+        PACKAGES_FILE="$(Build.SourcesDirectory)/nuget-packages-to-sync.txt"
+
+        if [ ! -f "$PACKAGES_FILE" ]; then
+          echo "##[error]nuget-packages-to-sync.txt not found in repo!"
+          exit 1
+        fi
+
+        mkdir -p $(UPLOAD_DIR)
+
+        TOTAL=$(grep -v '^\s*#' "$PACKAGES_FILE" | grep -v '^\s*$' | wc -l)
+        echo "Total packages to sync: $TOTAL"
+        echo "══════════════════════════════════════"
+
+        COUNT=0
+        while IFS= read -r LINE || [ -n "$LINE" ]; do
+          [[ -z "$LINE" || "$LINE" == \#* ]] && continue
+          COUNT=$((COUNT + 1))
+
+          # Parse packageId:version
+          PACKAGE_ID=$(echo $LINE | cut -d':' -f1)
+          VERSION=$(echo $LINE    | cut -d':' -f2)
+
+          # NuGet uses lowercase package IDs in URLs
+          PACKAGE_ID_LOWER=$(echo $PACKAGE_ID | tr '[:upper:]' '[:lower:]')
+          VERSION_LOWER=$(echo $VERSION | tr '[:upper:]' '[:lower:]')
+
+          echo "[$COUNT/$TOTAL] $PACKAGE_ID $VERSION"
+
+          # NuGet flat2 URL format:
+          # /flat2/{packageId}/{version}/{packageId}.{version}.nupkg
+          FILE="${PACKAGE_ID_LOWER}.${VERSION_LOWER}.nupkg"
+          URL="${NUGET_BASE}/${PACKAGE_ID_LOWER}/${VERSION_LOWER}/${FILE}"
+          OUT="$(UPLOAD_DIR)/${FILE}"
+
+          HTTP=$(curl -s -L -H "$AUTH" \
+            -w "%{http_code}" \
+            -o "$OUT" \
+            "$URL" 2>/dev/null || echo "000")
+
+          if [ "$HTTP" = "200" ]; then
+            SIZE=$(ls -lh "$OUT" | awk '{print $5}')
+            echo "  nupkg → ✅ ($SIZE)"
+          else
+            rm -f "$OUT"
+            echo "  nupkg → ⏭  $HTTP (skipping)"
+          fi
+
+        done < "$PACKAGES_FILE"
+
+        echo "══════════════════════════════════════"
+        echo "Total files ready to upload:"
+        find $(UPLOAD_DIR) -type f | sort
+        echo "Total: $(find $(UPLOAD_DIR) -type f | wc -l) files"
+
+  # ── Step 3: Check if files exist ─────────────────────────────────
+  - task: CmdLine@2
+    displayName: 'Check files to upload'
+    inputs:
+      script: |
+        FILE_COUNT=$(find $(UPLOAD_DIR) -type f -name "*.nupkg" | wc -l)
+        echo "Files to upload: $FILE_COUNT"
+        find $(UPLOAD_DIR) -type f | sort
+
+        if [ "$FILE_COUNT" -eq 0 ]; then
+          echo "##[warning]No files to upload!"
+        fi
+
+  # ── Step 4: Upload to JFrog ───────────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'Push NuGet packages to JFrog'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf rt u "$(UPLOAD_DIR)/*.nupkg" "$(JFROG_NUGET_REPO)/" --flat=true --threads=10 --detailed-summary --fail-no-op=false
+          
+  # ── Step 4: Verify ───────────────────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'Verify packages in JFrog'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf rt search "$(JFROG_NUGET_REPO)/*.nupkg" --include-dirs=false

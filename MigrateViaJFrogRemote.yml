@@ -1,0 +1,143 @@
+trigger: none
+
+jobs:
+- job: MigrateViaNuGetRemoteRepo
+  displayName: 'Pull NuGet packages via JFrog Remote → Copy to Local'
+  pool:
+    name: Default
+
+  variables:
+    JFROG_REMOTE_REPO: 'testrepo-rem'
+    JFROG_LOCAL_REPO: 'testrepo-local'
+    ADO_ORG: 'sumanthsv'
+    ADO_PROJECT: 'nugetproject'
+    ADO_FEED: 'nuget-feed'
+    PACKAGES_FILE: '$(Pipeline.Workspace)/nuget-packages.txt'
+    CSPROJ_DIR: '$(Pipeline.Workspace)/MigrateApp'
+    CSPROJ_FILE: '$(Pipeline.Workspace)/MigrateApp/MigrateApp.csproj'
+
+  steps:
+  - checkout: self
+
+  # ── Step 1: JFrog CLI Pre-checks ─────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'JFrog CLI Pre-checks'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf c show
+        jf rt ping
+
+  # ── Step 2: Fetch all packages from Azure feed ────────────────────
+  - task: CmdLine@2
+    displayName: 'Fetch all NuGet packages from Azure feed'
+    env:
+      ADO_PAT: $(ADO_PAT)
+    inputs:
+      script: |
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        AUTH="Authorization: Basic ${BASE64_PAT}"
+        API_BASE="https://feeds.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_apis/packaging/feeds/$(ADO_FEED)"
+
+        PAGE_SIZE=100
+        SKIP=0
+        TOTAL=0
+        > $(PACKAGES_FILE)
+
+        echo "Fetching NuGet packages..."
+
+        while true; do
+          PAGE=$(curl -sf -H "$AUTH" \
+            "${API_BASE}/packages?protocolType=nuget&\$top=${PAGE_SIZE}&\$skip=${SKIP}&api-version=7.0-preview.1" \
+            2>/dev/null || echo "")
+
+          if [ -z "$PAGE" ]; then
+            echo "Empty response, stopping"
+            break
+          fi
+
+          if ! echo "$PAGE" | jq empty 2>/dev/null; then
+            echo "Invalid JSON, stopping"
+            break
+          fi
+
+          PAGE_COUNT=$(echo "$PAGE" | jq '.value | length' 2>/dev/null || echo "0")
+
+          if [ -z "$PAGE_COUNT" ] || [ "$PAGE_COUNT" = "0" ] || [ "$PAGE_COUNT" = "null" ]; then
+            echo "No more packages, stopping"
+            break
+          fi
+
+          echo "Got $PAGE_COUNT packages"
+          echo "$PAGE" | jq -r '.value[] | . as $pkg | .versions[].version as $ver | $pkg.name + ":" + $ver' >> $(PACKAGES_FILE)
+
+          TOTAL=$((TOTAL + PAGE_COUNT))
+          SKIP=$((SKIP + PAGE_SIZE))
+          [ "$TOTAL" -ge 100000 ] && break
+        done
+
+        echo "══════════════════════════════════════"
+        echo "Total packages: $TOTAL"
+        echo "Package list:"
+        cat $(PACKAGES_FILE)
+
+  # ── Step 3: Generate .csproj from package list ────────────────────
+  - task: CmdLine@2
+    displayName: 'Generate .csproj from package list'
+    inputs:
+      script: |
+        mkdir -p $(CSPROJ_DIR)
+
+        cat > $(CSPROJ_FILE) << 'EOF'
+        <Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup>
+            <OutputType>Exe</OutputType>
+            <TargetFramework>net8.0</TargetFramework>
+          </PropertyGroup>
+          <ItemGroup>
+        EOF
+
+        while IFS= read -r LINE || [ -n "$LINE" ]; do
+          [[ -z "$LINE" || "$LINE" == \#* ]] && continue
+
+          PACKAGE_ID=$(echo $LINE | cut -d':' -f1)
+          VERSION=$(echo $LINE    | cut -d':' -f2)
+
+          echo "    <PackageReference Include=\"${PACKAGE_ID}\" Version=\"${VERSION}\" />" >> $(CSPROJ_FILE)
+
+        done < $(PACKAGES_FILE)
+
+        cat >> $(CSPROJ_FILE) << 'EOF'
+          </ItemGroup>
+        </Project>
+        EOF
+
+        echo "Generated .csproj:"
+        cat $(CSPROJ_FILE)
+
+  # ── Step 4: Configure and restore in same task ───────────────────
+  - task: JFrogCliV2@1
+    displayName: 'Configure and restore NuGet packages via JFrog'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      workingDirectory: '$(CSPROJ_DIR)'
+      command: |
+        jf dotnet-config --repo-resolve=$(JFROG_REMOTE_REPO) --server-id-resolve=$JFROG_CLI_SERVER_ID
+        jf dotnet restore "$(CSPROJ_FILE)" --build-name="$(Build.DefinitionName)" --build-number="$(Build.BuildNumber)"
+
+        
+  # ── Step 6: Copy from remote cache to local repo ─────────────────
+  - task: JFrogCliV2@1
+    displayName: 'Copy from remote cache to local repo'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf rt cp "$(JFROG_REMOTE_REPO)-cache/*.nupkg" "$(JFROG_LOCAL_REPO)/" --flat=true --threads=10 --fail-no-op=false
+
+  # ── Step 7: Verify ───────────────────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'Verify packages in local repo'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf rt search "$(JFROG_LOCAL_REPO)/*.nupkg" --include-dirs=false

@@ -1,0 +1,146 @@
+trigger: none
+
+jobs:
+- job: MigrateAllNuGetPackages
+  displayName: 'Migrate ALL NuGet packages from ADO to JFrog'
+  pool:
+    name: Default
+
+  variables:
+    JFROG_NUGET_REPO: 'bupa-nuget-local'
+    ADO_ORG: 'sumanthsv'
+    ADO_PROJECT: 'nugetproject'
+    ADO_FEED: 'nuget-feed'
+    UPLOAD_DIR: '$(Pipeline.Workspace)/nuget-upload'
+
+  steps:
+  - checkout: self
+
+  # ── Step 1: JFrog CLI Pre-checks ─────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'JFrog CLI Pre-checks'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf c show
+        jf rt ping
+
+  # ── Step 2: Download ALL packages with ALL versions ───────────────
+  - task: CmdLine@2
+    displayName: 'Download ALL NuGet packages from Azure feed'
+    env:
+      ADO_PAT: $(ADO_PAT)
+    inputs:
+      script: |
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        AUTH="Authorization: Basic ${BASE64_PAT}"
+        NUGET_BASE="https://pkgs.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_packaging/$(ADO_FEED)/nuget/v3/flat2"
+        API_BASE="https://feeds.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_apis/packaging/feeds/$(ADO_FEED)"
+
+        mkdir -p $(UPLOAD_DIR)
+        PAGE_SIZE=100
+        SKIP=0
+        TOTAL=0
+
+        echo "Starting paginated NuGet sync..."
+
+        while true; do
+          echo "──────────────────────────────────────"
+          echo "Fetching page: skip=$SKIP"
+
+          PAGE=$(curl -sf -H "$AUTH" \
+            "${API_BASE}/packages?protocolType=nuget&\$top=${PAGE_SIZE}&\$skip=${SKIP}&api-version=7.0-preview.1" \
+            2>/dev/null || echo "")
+
+          # Validate response
+          if [ -z "$PAGE" ]; then
+            echo "Empty response, stopping"
+            break
+          fi
+
+          if ! echo "$PAGE" | jq empty 2>/dev/null; then
+            echo "Invalid JSON response, stopping"
+            break
+          fi
+
+          PAGE_COUNT=$(echo "$PAGE" | jq '.value | length' 2>/dev/null || echo "0")
+
+          if [ -z "$PAGE_COUNT" ] || [ "$PAGE_COUNT" = "0" ] || [ "$PAGE_COUNT" = "null" ]; then
+            echo "No more packages, stopping"
+            break
+          fi
+
+          echo "Got $PAGE_COUNT packages"
+          TOTAL=$((TOTAL + PAGE_COUNT))
+
+          echo "$PAGE" | jq -c '.value[]' | while read pkg; do
+            PACKAGE_ID=$(echo $pkg | jq -r '.name')
+            VERSIONS=$(echo $pkg   | jq -r '.versions[].version')
+            VERSION_COUNT=$(echo "$VERSIONS" | wc -l)
+
+            echo "══════════════════════════════════════"
+            echo "Package : $PACKAGE_ID ($VERSION_COUNT versions)"
+
+            # NuGet uses lowercase in URLs
+            PACKAGE_ID_LOWER=$(echo $PACKAGE_ID | tr '[:upper:]' '[:lower:]')
+
+            for VERSION in $VERSIONS; do
+              VERSION_LOWER=$(echo $VERSION | tr '[:upper:]' '[:lower:]')
+              echo "  ── Version: $VERSION"
+
+              FILE="${PACKAGE_ID_LOWER}.${VERSION_LOWER}.nupkg"
+              URL="${NUGET_BASE}/${PACKAGE_ID_LOWER}/${VERSION_LOWER}/${FILE}"
+              OUT="$(UPLOAD_DIR)/${FILE}"
+
+              # -L to follow 303 redirect to Azure Blob Storage
+              HTTP=$(curl -s -L -H "$AUTH" \
+                -w "%{http_code}" \
+                -o "$OUT" \
+                "$URL" 2>/dev/null || echo "000")
+
+              if [ "$HTTP" = "200" ]; then
+                SIZE=$(ls -lh "$OUT" | awk '{print $5}')
+                echo "  nupkg → ✅ ($SIZE)"
+              else
+                rm -f "$OUT"
+                echo "  nupkg → ⏭  $HTTP"
+              fi
+            done
+          done
+
+          SKIP=$((SKIP + PAGE_SIZE))
+          [ "$TOTAL" -ge 100000 ] && break
+        done
+
+        echo "══════════════════════════════════════"
+        echo "Total packages processed : $TOTAL"
+        echo "Total files ready        : $(find $(UPLOAD_DIR) -type f | wc -l)"
+        find $(UPLOAD_DIR) -type f | sort
+
+  # ── Step 3: Check files ───────────────────────────────────────────
+  - task: CmdLine@2
+    displayName: 'Check files to upload'
+    inputs:
+      script: |
+        FILE_COUNT=$(find $(UPLOAD_DIR) -type f -name "*.nupkg" | wc -l)
+        echo "Files to upload: $FILE_COUNT"
+        find $(UPLOAD_DIR) -type f | sort
+        if [ "$FILE_COUNT" -eq 0 ]; then
+          echo "##[warning]No files found to upload!"
+        fi
+
+  # ── Step 4: Upload to JFrog ───────────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'Push all NuGet packages to JFrog'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf rt u "$(UPLOAD_DIR)/*.nupkg" "$(JFROG_NUGET_REPO)/" --flat=true --threads=10 --detailed-summary --fail-no-op=false
+
+  # ── Step 5: Verify ───────────────────────────────────────────────
+  - task: JFrogCliV2@1
+    displayName: 'Verify packages in JFrog'
+    inputs:
+      jfrogPlatformConnection: 'jfrog-psblr'
+      command: |
+        jf rt search "$(JFROG_NUGET_REPO)/*.nupkg" --include-dirs=false

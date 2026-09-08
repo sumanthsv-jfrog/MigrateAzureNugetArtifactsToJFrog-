@@ -202,19 +202,7 @@ Click **Test** to verify connection, then **Save**.
 | Option 2 cache repo | JFrog remote cache is automatically named `{repo-key}-cache` |
 | `jf dotnet-config` + `jf dotnet restore` | Must run in the **same `JFrogCliV2@1` task** — config file is task-scoped |
 
----
 
-## Recommended Approach
-
-| Scenario | Recommended Pipeline |
-|---|---|
-| See what's in the feed | Pipeline 1 — List |
-| Migrate selected packages | Pipeline 2 — Migrate Specific (Option 1) |
-| Full one-time migration | Pipeline 3 — Migrate All (Option 1) |
-| Ongoing sync / proxy | Pipeline 4 — Remote Repo (Option 2) |
-| Air-gapped environment | Option 1 — packages physically copied to JFrog |
-
----
 
 ## Recommended Migration Steps
 
@@ -232,7 +220,6 @@ Follow this order for a safe migration:
 
 - All pipelines are **read-only on Azure Artifacts** — no packages are modified or deleted
 - PAT only needs **Packaging Read** scope — cannot accidentally write or delete
-- Safe to run on production feeds
 
 ---
 

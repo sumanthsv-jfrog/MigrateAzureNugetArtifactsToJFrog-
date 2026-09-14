@@ -2,7 +2,7 @@ trigger: none
 
 jobs:
 - job: MigrateAllNuGetPackages
-  displayName: 'Migrate ALL NuGet packages from ADO to JFrog'
+  displayName: 'Migrate ALL (delta) NuGet packages from ADO to JFrog'
   pool:
     name: Default
 
@@ -12,9 +12,13 @@ jobs:
     ADO_PROJECT: 'nugetproject'
     ADO_FEED: 'nuget-feed'
     UPLOAD_DIR: '$(Pipeline.Workspace)/nuget-upload'
+    MIGRATED_FILE: '$(Build.SourcesDirectory)/migrated-packages.txt'
+    CURRENT_FILE: '$(Pipeline.Workspace)/current-packages.txt'
+    DELTA_FILE: '$(Pipeline.Workspace)/delta-packages.txt'
 
   steps:
   - checkout: self
+    persistCredentials: true
 
   # ── Step 1: JFrog CLI Pre-checks ─────────────────────────────────
   - task: JFrogCliV2@1
@@ -25,119 +29,167 @@ jobs:
         jf c show
         jf rt ping
 
-  # ── Step 2: Download ALL packages with ALL versions ───────────────
+  # ── Step 2: Clean upload directory ────────────────────────────────
   - task: CmdLine@2
-    displayName: 'Download ALL NuGet packages from Azure feed'
+    displayName: 'Clean upload directory'
+    inputs:
+      script: |
+        rm -rf $(UPLOAD_DIR)
+        mkdir -p $(UPLOAD_DIR)
+        echo "Clean upload directory ready"
+
+  # ── Step 3: Fetch current packages from Azure feed ─────────────────
+  - task: CmdLine@2
+    displayName: 'Fetch current packages from Azure feed'
     env:
       ADO_PAT: $(ADO_PAT)
     inputs:
       script: |
         BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
         AUTH="Authorization: Basic ${BASE64_PAT}"
-        NUGET_BASE="https://pkgs.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_packaging/$(ADO_FEED)/nuget/v3/flat2"
         API_BASE="https://feeds.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_apis/packaging/feeds/$(ADO_FEED)"
 
-        mkdir -p $(UPLOAD_DIR)
         PAGE_SIZE=100
         SKIP=0
         TOTAL=0
+        > $(CURRENT_FILE)
 
-        echo "Starting paginated NuGet sync..."
+        echo "Fetching current packages from Azure feed..."
 
         while true; do
-          echo "──────────────────────────────────────"
-          echo "Fetching page: skip=$SKIP"
-
           PAGE=$(curl -sf -H "$AUTH" \
             "${API_BASE}/packages?protocolType=nuget&\$top=${PAGE_SIZE}&\$skip=${SKIP}&api-version=7.0-preview.1" \
             2>/dev/null || echo "")
 
-          # Validate response
-          if [ -z "$PAGE" ]; then
-            echo "Empty response, stopping"
-            break
-          fi
-
-          if ! echo "$PAGE" | jq empty 2>/dev/null; then
-            echo "Invalid JSON response, stopping"
-            break
-          fi
+          [ -z "$PAGE" ] && break
+          echo "$PAGE" | jq empty 2>/dev/null || break
 
           PAGE_COUNT=$(echo "$PAGE" | jq '.value | length' 2>/dev/null || echo "0")
+          [ -z "$PAGE_COUNT" ] || [ "$PAGE_COUNT" = "0" ] || [ "$PAGE_COUNT" = "null" ] && break
 
-          if [ -z "$PAGE_COUNT" ] || [ "$PAGE_COUNT" = "0" ] || [ "$PAGE_COUNT" = "null" ]; then
-            echo "No more packages, stopping"
-            break
-          fi
+          echo "$PAGE" | jq -r '.value[] | . as $pkg | .versions[].version as $ver | $pkg.name + ":" + $ver' >> $(CURRENT_FILE)
 
-          echo "Got $PAGE_COUNT packages"
           TOTAL=$((TOTAL + PAGE_COUNT))
-
-          echo "$PAGE" | jq -c '.value[]' | while read pkg; do
-            PACKAGE_ID=$(echo $pkg | jq -r '.name')
-            VERSIONS=$(echo $pkg   | jq -r '.versions[].version')
-            VERSION_COUNT=$(echo "$VERSIONS" | wc -l)
-
-            echo "══════════════════════════════════════"
-            echo "Package : $PACKAGE_ID ($VERSION_COUNT versions)"
-
-            # NuGet uses lowercase in URLs
-            PACKAGE_ID_LOWER=$(echo $PACKAGE_ID | tr '[:upper:]' '[:lower:]')
-
-            for VERSION in $VERSIONS; do
-              VERSION_LOWER=$(echo $VERSION | tr '[:upper:]' '[:lower:]')
-              echo "  ── Version: $VERSION"
-
-              FILE="${PACKAGE_ID_LOWER}.${VERSION_LOWER}.nupkg"
-              URL="${NUGET_BASE}/${PACKAGE_ID_LOWER}/${VERSION_LOWER}/${FILE}"
-              OUT="$(UPLOAD_DIR)/${FILE}"
-
-              # -L to follow 303 redirect to Azure Blob Storage
-              HTTP=$(curl -s -L -H "$AUTH" \
-                -w "%{http_code}" \
-                -o "$OUT" \
-                "$URL" 2>/dev/null || echo "000")
-
-              if [ "$HTTP" = "200" ]; then
-                SIZE=$(ls -lh "$OUT" | awk '{print $5}')
-                echo "  nupkg → ✅ ($SIZE)"
-              else
-                rm -f "$OUT"
-                echo "  nupkg → ⏭  $HTTP"
-              fi
-            done
-          done
-
           SKIP=$((SKIP + PAGE_SIZE))
           [ "$TOTAL" -ge 100000 ] && break
         done
 
-        echo "══════════════════════════════════════"
-        echo "Total packages processed : $TOTAL"
-        echo "Total files ready        : $(find $(UPLOAD_DIR) -type f | wc -l)"
-        find $(UPLOAD_DIR) -type f | sort
+        sort $(CURRENT_FILE) -o $(CURRENT_FILE)
+        echo "Total packages currently in Azure feed: $(wc -l < $(CURRENT_FILE))"
 
-  # ── Step 3: Check files ───────────────────────────────────────────
+  # ── Step 4: Compute delta — only new packages since last run ──────
   - task: CmdLine@2
-    displayName: 'Check files to upload'
+    displayName: 'Compute delta (new packages only)'
     inputs:
       script: |
-        FILE_COUNT=$(find $(UPLOAD_DIR) -type f -name "*.nupkg" | wc -l)
-        echo "Files to upload: $FILE_COUNT"
-        find $(UPLOAD_DIR) -type f | sort
-        if [ "$FILE_COUNT" -eq 0 ]; then
-          echo "##[warning]No files found to upload!"
+        if [ ! -f "$(MIGRATED_FILE)" ]; then
+          echo "No migrated-packages.txt found — first run, migrating ALL packages"
+          cp $(CURRENT_FILE) $(DELTA_FILE)
+        else
+          sort $(MIGRATED_FILE) -o $(MIGRATED_FILE)
+          comm -23 $(CURRENT_FILE) $(MIGRATED_FILE) > $(DELTA_FILE)
         fi
 
-  # ── Step 4: Upload to JFrog ───────────────────────────────────────
+        DELTA_COUNT=$(wc -l < $(DELTA_FILE))
+        echo "══════════════════════════════════════"
+        echo "New packages to migrate: $DELTA_COUNT"
+        cat $(DELTA_FILE)
+
+        if [ "$DELTA_COUNT" -eq 0 ]; then
+          echo "##[warning]No new packages — nothing to migrate!"
+        fi
+
+  # ── Step 5: Download only delta packages ───────────────────────────
+  - task: CmdLine@2
+    displayName: 'Download new packages from Azure feed'
+    env:
+      ADO_PAT: $(ADO_PAT)
+    inputs:
+      script: |
+        DELTA_COUNT=$(wc -l < $(DELTA_FILE))
+        [ "$DELTA_COUNT" -eq 0 ] && { echo "Nothing to download"; exit 0; }
+
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        AUTH="Authorization: Basic ${BASE64_PAT}"
+        NUGET_BASE="https://pkgs.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_packaging/$(ADO_FEED)/nuget/v3/flat2"
+
+        TOTAL=$DELTA_COUNT
+        COUNT=0
+
+        while IFS= read -r LINE || [ -n "$LINE" ]; do
+          [[ -z "$LINE" ]] && continue
+          COUNT=$((COUNT + 1))
+
+          PACKAGE_ID=$(echo $LINE | cut -d':' -f1 | tr '[:upper:]' '[:lower:]')
+          VERSION=$(echo $LINE    | cut -d':' -f2 | tr '[:upper:]' '[:lower:]')
+
+          echo "[$COUNT/$TOTAL] $PACKAGE_ID $VERSION"
+
+          FILE="${PACKAGE_ID}.${VERSION}.nupkg"
+          URL="${NUGET_BASE}/${PACKAGE_ID}/${VERSION}/${FILE}"
+          OUT="$(UPLOAD_DIR)/${FILE}"
+
+          HTTP=$(curl -s -L -H "$AUTH" -w "%{http_code}" -o "$OUT" "$URL" 2>/dev/null || echo "000")
+
+          if [ "$HTTP" = "200" ]; then
+            SIZE=$(ls -lh "$OUT" | awk '{print $5}')
+            echo "  nupkg → ✅ ($SIZE)"
+          else
+            rm -f "$OUT"
+            echo "  nupkg → ⏭  $HTTP"
+          fi
+
+        done < $(DELTA_FILE)
+
+        echo "Total files ready: $(find $(UPLOAD_DIR) -type f | wc -l)"
+
+  # ── Step 6: Check if upload needed ────────────────────────────────
+  - task: CmdLine@2
+    displayName: 'Check if upload needed'
+    inputs:
+      script: |
+        FILE_COUNT=$(find $(UPLOAD_DIR) -type f -name "*.nupkg" 2>/dev/null | wc -l)
+        echo "Files to upload: $FILE_COUNT"
+        find $(UPLOAD_DIR) -type f | sort
+
+        if [ "$FILE_COUNT" -eq 0 ]; then
+          echo "##vso[task.setvariable variable=SKIP_UPLOAD]true"
+        else
+          echo "##vso[task.setvariable variable=SKIP_UPLOAD]false"
+        fi
+
+  # ── Step 7: Upload delta to JFrog ──────────────────────────────────
   - task: JFrogCliV2@1
-    displayName: 'Push all NuGet packages to JFrog'
+    displayName: 'Push new packages to JFrog'
+    condition: ne(variables['SKIP_UPLOAD'], 'true')
     inputs:
       jfrogPlatformConnection: 'jfrog-psblr'
       command: |
         jf rt u "$(UPLOAD_DIR)/*.nupkg" "$(JFROG_NUGET_REPO)/" --flat=true --threads=10 --detailed-summary --fail-no-op=false
 
-  # ── Step 5: Verify ───────────────────────────────────────────────
+  # ── Step 8: Update migrated-packages.txt and commit ─────────────────
+  - task: CmdLine@2
+    displayName: 'Update migrated-packages.txt'
+    condition: ne(variables['SKIP_UPLOAD'], 'true')
+    inputs:
+      script: |
+        if [ -f "$(MIGRATED_FILE)" ]; then
+          cat $(MIGRATED_FILE) $(DELTA_FILE) | sort -u > $(MIGRATED_FILE).tmp
+          mv $(MIGRATED_FILE).tmp $(MIGRATED_FILE)
+        else
+          sort $(DELTA_FILE) -o $(MIGRATED_FILE)
+        fi
+
+        echo "Total tracked packages: $(wc -l < $(MIGRATED_FILE))"
+
+        cd $(Build.SourcesDirectory)
+        git config user.email "pipeline@ado.local"
+        git config user.name "ADO Pipeline"
+        git add migrated-packages.txt
+        git commit -m "Update migrated-packages.txt — $(date +%Y-%m-%d)" || echo "Nothing to commit"
+        git push origin HEAD:$(Build.SourceBranchName) || echo "Push failed — check permissions"
+
+  # ── Step 9: Verify ────────────────────────────────────────────────
   - task: JFrogCliV2@1
     displayName: 'Verify packages in JFrog'
     inputs:

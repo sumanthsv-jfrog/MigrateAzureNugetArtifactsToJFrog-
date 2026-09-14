@@ -125,30 +125,6 @@ Pipelines 2 and 3 commit updates to `migrated-packages.txt` back to the repo. Th
 
 Also ensure `checkout: self` includes `persistCredentials: true` in the pipeline (already included in the YAML below).
 
----
-
-## Setup — Cache Packages in Azure Feed
-
-Configure NuGet to route downloads through Azure Artifacts feed (so packages get cached there):
-
-```bash
-# Add Azure feed as NuGet source
-dotnet nuget add source \
-  "https://pkgs.dev.azure.com/{ORG}/{PROJECT}/_packaging/{FEED}/nuget/v3/index.json" \
-  --name "azure-nuget-feed" \
-  --username "YOUR_USERNAME" \
-  --password "YOUR_PAT" \
-  --store-password-in-clear-text
-
-# Disable nuget.org to force routing through Azure feed
-dotnet nuget disable source nuget.org
-
-# Clear local cache and restore to populate Azure feed
-dotnet nuget locals all --clear
-dotnet restore
-```
-
----
 
 ## Delta Migration — How It Works
 
@@ -316,7 +292,6 @@ Follow this order for a safe migration:
 
 - All pipelines are **read-only on Azure Artifacts** — no packages are modified or deleted
 - PAT only needs **Packaging Read** scope — cannot accidentally write or delete
-- Safe to run on production feeds
 - Pipelines 2 and 3 write only to `migrated-packages.txt` in your own repo — no other files are touched
 - Running Pipeline 2 and Pipeline 3 interchangeably is safe — they share the same tracking file
 

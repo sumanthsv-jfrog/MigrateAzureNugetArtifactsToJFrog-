@@ -13,7 +13,7 @@ jobs:
     ADO_FEED: 'nuget-feed'
     UPLOAD_DIR: '$(Pipeline.Workspace)/nuget-upload'
     PACKAGES_FILE: '$(Build.SourcesDirectory)/nuget-packages-to-sync.txt'
-    MIGRATED_FILE: '$(Build.SourcesDirectory)/migrated-packages.txt'
+    MIGRATED_FILE: '$(Build.SourcesDirectory)/migrated-packages_$(ADO_FEED).txt'
     TO_MIGRATE_FILE: '$(Pipeline.Workspace)/to-migrate.txt'
 
   steps:

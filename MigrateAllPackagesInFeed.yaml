@@ -12,7 +12,7 @@ jobs:
     ADO_PROJECT: 'nugetproject'
     ADO_FEED: 'nuget-feed'
     UPLOAD_DIR: '$(Pipeline.Workspace)/nuget-upload'
-    MIGRATED_FILE: '$(Build.SourcesDirectory)/migrated-packages.txt'
+    MIGRATED_FILE: '$(Build.SourcesDirectory)/migrated-packages_$(ADO_FEED).txt'
     CURRENT_FILE: '$(Pipeline.Workspace)/current-packages.txt'
     DELTA_FILE: '$(Pipeline.Workspace)/delta-packages.txt'
 

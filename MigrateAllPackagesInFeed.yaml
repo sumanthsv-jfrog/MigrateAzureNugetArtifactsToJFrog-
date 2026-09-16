@@ -45,7 +45,7 @@ jobs:
       ADO_PAT: $(ADO_PAT)
     inputs:
       script: |
-        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64 | tr -d '\n')
         AUTH="Authorization: Basic ${BASE64_PAT}"
         API_BASE="https://feeds.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_apis/packaging/feeds/$(ADO_FEED)"
 

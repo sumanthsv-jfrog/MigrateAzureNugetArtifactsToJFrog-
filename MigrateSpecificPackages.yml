@@ -80,7 +80,7 @@ jobs:
         TO_MIGRATE_COUNT=$(wc -l < $(TO_MIGRATE_FILE))
         [ "$TO_MIGRATE_COUNT" -eq 0 ] && { echo "Nothing to download"; exit 0; }
 
-        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64)
+        BASE64_PAT=$(echo -n ":${ADO_PAT}" | base64 | tr -d '\n')
         AUTH="Authorization: Basic ${BASE64_PAT}"
         NUGET_BASE="https://pkgs.dev.azure.com/$(ADO_ORG)/$(ADO_PROJECT)/_packaging/$(ADO_FEED)/nuget/v3/flat2"
 
